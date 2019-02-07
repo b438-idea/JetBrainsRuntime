@@ -31,7 +31,8 @@
 #include <commdlg.h>
 #include <cderr.h>
 #include <shlobj.h>
-
+#include <shlwapi.h>
+#include <shobjidl.h>
 
 /************************************************************************
  * AwtFileDialog fields
@@ -237,6 +238,270 @@ FileDialogHookProc(HWND hdlg, UINT uiMsg, WPARAM wParam, LPARAM lParam)
     CATCH_BAD_ALLOC_RET(TRUE);
 }
 
+struct FileDialogData {
+    IFileDialog *fileDialog;
+    LPTSTR *result;
+    UINT resultSize;
+    jobject peer;
+};
+
+void GetSelectedResults(FileDialogData *data) {
+    IFileOpenDialog *fileOpenDialog = NULL;
+    if (!SUCCEEDED(data->fileDialog->QueryInterface(IID_PPV_ARGS(&fileOpenDialog))))
+        return;
+
+    LPTSTR resultBuffer = NULL;
+    UINT currentOffset = 0;
+    IShellItemArray *psia;
+    if (SUCCEEDED(fileOpenDialog->GetSelectedItems(&psia))) {
+        DWORD itemsCount;
+        if (SUCCEEDED(psia->GetCount(&itemsCount))) {
+            UINT maxBufferSize = (MAX_PATH + 1) * itemsCount + 1;
+            resultBuffer = new TCHAR[maxBufferSize];
+            data->resultSize = maxBufferSize;
+            for (DWORD i = 0; i < itemsCount; i++) {
+                IShellItem *psi;
+                if (SUCCEEDED(psia->GetItemAt(i, &psi))) {
+                    if (i == 0 && itemsCount > 1) {
+                        IShellItem *psiParent;
+                        VERIFY(SUCCEEDED(psi->GetParent(&psiParent)));
+
+                        LPTSTR filePath;
+                        if (SUCCEEDED(psiParent->GetDisplayName(SIGDN_FILESYSPATH, &filePath))) {
+                            size_t filePathLength = _tcslen(filePath);
+                            _tcsncpy(resultBuffer + currentOffset, filePath, filePathLength);
+                            resultBuffer[currentOffset + filePathLength] = _T('\0');
+                            currentOffset += filePathLength + 1;
+                            CoTaskMemFree(filePath);
+                        }
+                        psiParent->Release();
+                    }
+
+                    LPTSTR filePath;
+                    SIGDN displayForm = itemsCount > 1 ? SIGDN_PARENTRELATIVE : SIGDN_FILESYSPATH;
+                    if (SUCCEEDED(psi->GetDisplayName(displayForm, &filePath))) {
+                        size_t filePathLength = _tcslen(filePath);
+                        _tcsncpy(resultBuffer + currentOffset, filePath, filePathLength);
+                        resultBuffer[currentOffset + filePathLength] = _T('\0');
+                        currentOffset += filePathLength + 1;
+                        CoTaskMemFree(filePath);
+                    }
+                    psi->Release();
+                }
+            }
+            resultBuffer[currentOffset] = _T('\0');
+            resultBuffer[currentOffset + 1] = _T('\0');
+            *(data->result) = resultBuffer;
+        }
+        psia->Release();
+        data->fileDialog->Close(S_OK);
+    }
+    fileOpenDialog->Release();
+}
+
+LRESULT CALLBACK
+FileDialogSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData)
+{
+    JNIEnv *env = (JNIEnv *)JNU_GetEnv(jvm, JNI_VERSION_1_2);
+
+    TRY;
+
+    HWND parent = ::GetParent(hWnd);
+
+    switch (uMsg) {
+        case WM_COMMAND: {
+            if (HIWORD(wParam) == BN_CLICKED && LOWORD(wParam) == IDOK) {
+                GetSelectedResults((FileDialogData*) dwRefData);
+            }
+            if (LOWORD(wParam) == IDCANCEL) {
+                jobject peer = (jobject) (::GetProp(hWnd, ModalDialogPeerProp));
+                env->CallVoidMethod(peer, AwtFileDialog::setHWndMID, (jlong) 0);
+            }
+            break;
+        }
+        case WM_SETICON: {
+            return 0;
+        }
+        case WM_DESTROY: {
+            FileDialogData *data = (FileDialogData*) dwRefData;
+            if (*data->result == NULL) {
+                GetSelectedResults(data);
+            }
+
+            HIMC hIMC = ::ImmGetContext(hWnd);
+            if (hIMC != NULL) {
+                ::ImmNotifyIME(hIMC, NI_COMPOSITIONSTR, CPS_CANCEL, 0);
+                ::ImmReleaseContext(hWnd, hIMC);
+            }
+
+            RemoveWindowSubclass(hWnd, &FileDialogSubclassProc, uIdSubclass);
+
+            ::RemoveProp(parent, ModalDialogPeerProp);
+            break;
+        }
+    }
+
+    return DefSubclassProc(hWnd, uMsg, wParam, lParam);
+
+    CATCH_BAD_ALLOC_RET(TRUE);
+}
+
+class CDialogEventHandler : public IFileDialogEvents
+{
+public:
+    IFACEMETHODIMP QueryInterface(REFIID riid, void** ppv)
+    {
+        static const QITAB qit[] = {
+                QITABENT(CDialogEventHandler, IFileDialogEvents),
+                { 0 },
+        };
+        return QISearch(this, qit, riid, ppv);
+    }
+
+    IFACEMETHODIMP_(ULONG) AddRef()
+    {
+        return InterlockedIncrement(&m_refCount);
+    }
+
+    IFACEMETHODIMP_(ULONG) Release()
+    {
+        long retVal = InterlockedDecrement(&m_refCount);
+        if (!retVal)
+            delete this;
+        return retVal;
+    }
+
+    IFACEMETHODIMP OnFolderChange(IFileDialog *fileDialog) {
+        if (!m_activated) {
+            InitDialog(fileDialog);
+            m_activated = true;
+        }
+        return S_OK;
+    };
+
+    IFACEMETHODIMP OnFileOk(IFileDialog *) { return S_OK; };
+    IFACEMETHODIMP OnFolderChanging(IFileDialog *, IShellItem *) { return S_OK; };
+    IFACEMETHODIMP OnHelp(IFileDialog *) { return S_OK; };
+    IFACEMETHODIMP OnSelectionChange(IFileDialog *) { return S_OK; };
+    IFACEMETHODIMP OnShareViolation(IFileDialog *, IShellItem *, FDE_SHAREVIOLATION_RESPONSE *) { return S_OK; };
+    IFACEMETHODIMP OnTypeChange(IFileDialog *pfd) { return S_OK; };
+    IFACEMETHODIMP OnOverwrite(IFileDialog *, IShellItem *, FDE_OVERWRITE_RESPONSE *) { return S_OK; };
+
+    CDialogEventHandler(FileDialogData *data) : data(data), m_refCount(1), m_activated(false) { };
+private:
+    ~CDialogEventHandler() { };
+    FileDialogData *data;
+    bool m_activated;
+    long m_refCount;
+
+    void InitDialog(IFileDialog *fileDialog) {
+        JNIEnv *env = (JNIEnv *)JNU_GetEnv(jvm, JNI_VERSION_1_2);
+
+        IOleWindow *pWindow = NULL;
+        HRESULT hr = fileDialog->QueryInterface(IID_PPV_ARGS(&pWindow));
+
+        if (!SUCCEEDED(hr))
+            return;
+
+        TRY;
+
+        HWND hdlg;
+        VERIFY(SUCCEEDED(pWindow->GetWindow(&hdlg)));
+        pWindow->Release();
+
+        HWND parent = ::GetParent(hdlg);
+        jobject peer = data->peer;
+        env->CallVoidMethod(peer, AwtFileDialog::setHWndMID, (jlong)parent);
+        ::SetProp(parent, ModalDialogPeerProp, reinterpret_cast<HANDLE>(peer));
+
+        // fix for 4508670 - disable CS_SAVEBITS
+        DWORD style = ::GetClassLong(hdlg, GCL_STYLE);
+        ::SetClassLong(hdlg, GCL_STYLE, style & ~CS_SAVEBITS);
+
+        // set appropriate icon for parentless dialogs
+        jobject awtParent = env->GetObjectField(peer, AwtFileDialog::parentID);
+        if (awtParent == NULL) {
+            ::SendMessage(parent, WM_SETICON, (WPARAM)ICON_BIG,
+                          (LPARAM)AwtToolkit::GetInstance().GetAwtIcon());
+        } else {
+            AwtWindow *awtWindow = (AwtWindow *)JNI_GET_PDATA(awtParent);
+            ::SendMessage(parent, WM_SETICON, (WPARAM)ICON_BIG,
+                          (LPARAM)(awtWindow->GetHIcon()));
+            ::SendMessage(parent, WM_SETICON, (WPARAM)ICON_SMALL,
+                          (LPARAM)(awtWindow->GetHIconSm()));
+            env->DeleteLocalRef(awtParent);
+        }
+
+        SetWindowSubclass(hdlg, &FileDialogSubclassProc, 0, (DWORD_PTR) data);
+
+        CATCH_BAD_ALLOC;
+    }
+};
+
+HRESULT CDialogEventHandler_CreateInstance(FileDialogData *data, REFIID riid, void **ppv)
+{
+    *ppv = NULL;
+    CDialogEventHandler *pDialogEventHandler = new CDialogEventHandler(data);
+    HRESULT hr = pDialogEventHandler->QueryInterface(riid, ppv);
+    pDialogEventHandler->Release();
+    return hr;
+}
+
+COMDLG_FILTERSPEC *CreateFilterSpec(UINT *count) {
+    UINT filterCount = 0;
+    for (UINT index = 0; index < MAX_FILTER_STRING - 1; index++) {
+        if (s_fileFilterString[index] == _T('\0')) {
+            filterCount++;
+            if (s_fileFilterString[index + 1] == _T('\0'))
+                break;
+        }
+    }
+    filterCount /= 2;
+    COMDLG_FILTERSPEC *filterSpec = new COMDLG_FILTERSPEC[filterCount];
+    UINT currentIndex = 0;
+    TCHAR *currentStart = s_fileFilterString;
+    for (UINT index = 0; index < MAX_FILTER_STRING - 1; index++) {
+        if (s_fileFilterString[index] == _T('\0')) {
+            if (currentIndex & 1) {
+                filterSpec[currentIndex / 2].pszSpec = currentStart;
+            } else {
+                filterSpec[currentIndex / 2].pszName = currentStart;
+            }
+            currentStart = s_fileFilterString + index + 1;
+            currentIndex++;
+            if (s_fileFilterString[index + 1] == _T('\0'))
+                break;
+        }
+    }
+    *count = filterCount;
+    return filterSpec;
+}
+
+IShellItem *CreateShellItem(LPTSTR path) {
+    size_t pathLength = _tcslen(path);
+    for (size_t index = 0; index < pathLength; index++) {
+        if (path[index] == _T('/'))
+            path[index] = _T('\\');
+    }
+
+    IShellItem *shellItem;
+    HRESULT hr = ::SHCreateItemInKnownFolder(FOLDERID_ComputerFolder, 0, path, IID_PPV_ARGS(&shellItem));
+    if (SUCCEEDED(hr) && shellItem != NULL)
+        return shellItem;
+    return NULL;
+}
+
+LPTSTR GetShortName(LPTSTR path) {
+    IShellItem *shellItem = CreateShellItem(path);
+    if (shellItem == NULL)
+        return NULL;
+
+    LPTSTR shortName = NULL;
+    shellItem->GetDisplayName(SIGDN_PARENTRELATIVE, &shortName);
+    shellItem->Release();
+    return shortName;
+}
+
 void
 AwtFileDialog::Show(void *p)
 {
@@ -256,13 +521,26 @@ AwtFileDialog::Show(void *p)
     AwtComponent* awtParent = NULL;
     jboolean multipleMode = JNI_FALSE;
 
+    IFileDialog *pfd = NULL;
+    IFileDialogEvents *pfde = NULL;
+    DWORD dwCookie;
+    IShellItem *psiResult = NULL;
+    LPTSTR pszFilePath = NULL;
+    COMDLG_FILTERSPEC *fileTypes = NULL;
+    FileDialogData data;
+
     OPENFILENAME ofn;
     memset(&ofn, 0, sizeof(ofn));
 
     peer = (jobject)p;
 
+    BOOL useNewAPI = FALSE;
     try {
         DASSERT(peer);
+
+        useNewAPI = JNU_CallStaticMethodByName(env, NULL,
+                "sun/awt/windows/WFileDialogPeer", "isUseNewAPI", "()Z").z == JNI_TRUE;
+
         target = env->GetObjectField(peer, AwtObject::targetID);
         parent = env->GetObjectField(peer, AwtFileDialog::parentID);
         if (parent != NULL) {
@@ -304,68 +582,140 @@ AwtFileDialog::Show(void *p)
             fileBuffer[0] = _T('\0');
         }
 
-        ofn.lStructSize = sizeof(ofn);
-        ofn.lpstrFilter = s_fileFilterString;
-        ofn.nFilterIndex = 1;
-        /*
-          Fix for 6488834.
-          To disable Win32 native parent modality we have to set
-          hwndOwner field to either NULL or some hidden window. For
-          parentless dialogs we use NULL to show them in the taskbar,
-          and for all other dialogs AwtToolkit's HWND is used.
-        */
-        if (awtParent != NULL)
-        {
-            ofn.hwndOwner = AwtToolkit::GetInstance().GetHWnd();
-        }
-        else
-        {
-            ofn.hwndOwner = NULL;
-        }
-        ofn.lpstrFile = fileBuffer;
-        ofn.nMaxFile = bufferLimit;
-        ofn.lpstrTitle = titleBuffer;
-        ofn.lpstrInitialDir = directoryBuffer;
-        ofn.Flags = OFN_LONGNAMES | OFN_OVERWRITEPROMPT | OFN_HIDEREADONLY |
-                    OFN_ENABLEHOOK | OFN_EXPLORER | OFN_ENABLESIZING;
-        fileFilter = env->GetObjectField(peer,
-        AwtFileDialog::fileFilterID);
-        if (!JNU_IsNull(env,fileFilter)) {
-            ofn.Flags |= OFN_ENABLEINCLUDENOTIFY;
-        }
-        ofn.lCustData = (LPARAM)peer;
-        ofn.lpfnHook = (LPOFNHOOKPROC)FileDialogHookProc;
+        fileFilter = env->GetObjectField(peer, AwtFileDialog::fileFilterID);
 
-        if (multipleMode == JNI_TRUE) {
-            ofn.Flags |= OFN_ALLOWMULTISELECT;
+        if (!useNewAPI) {
+            ofn.lStructSize = sizeof(ofn);
+            ofn.lpstrFilter = s_fileFilterString;
+            ofn.nFilterIndex = 1;
+            /*
+              Fix for 6488834.
+              To disable Win32 native parent modality we have to set
+              hwndOwner field to either NULL or some hidden window. For
+              parentless dialogs we use NULL to show them in the taskbar,
+              and for all other dialogs AwtToolkit's HWND is used.
+            */
+            if (awtParent != NULL) {
+                ofn.hwndOwner = AwtToolkit::GetInstance().GetHWnd();
+            } else {
+                ofn.hwndOwner = NULL;
+            }
+            ofn.lpstrFile = fileBuffer;
+            ofn.nMaxFile = bufferLimit;
+            ofn.lpstrTitle = titleBuffer;
+            ofn.lpstrInitialDir = directoryBuffer;
+            ofn.Flags = OFN_LONGNAMES | OFN_OVERWRITEPROMPT | OFN_HIDEREADONLY |
+                        OFN_ENABLEHOOK | OFN_EXPLORER | OFN_ENABLESIZING;
+
+            if (!JNU_IsNull(env,fileFilter)) {
+                ofn.Flags |= OFN_ENABLEINCLUDENOTIFY;
+            }
+            ofn.lCustData = (LPARAM)peer;
+            ofn.lpfnHook = (LPOFNHOOKPROC)FileDialogHookProc;
+
+            if (multipleMode == JNI_TRUE) {
+                ofn.Flags |= OFN_ALLOWMULTISELECT;
+            }
+
+            // Save current directory, so we can reset if it changes.
+            currentDirectory = new TCHAR[MAX_PATH+1];
+
+            VERIFY(::GetCurrentDirectory(MAX_PATH, currentDirectory) > 0);
         }
-
-        // Save current directory, so we can reset if it changes.
-        currentDirectory = new TCHAR[MAX_PATH+1];
-
-        VERIFY(::GetCurrentDirectory(MAX_PATH, currentDirectory) > 0);
 
         mode = env->GetIntField(target, AwtFileDialog::modeID);
 
         AwtDialog::CheckInstallModalHook();
 
-        // show the Win32 file dialog
-        if (mode == java_awt_FileDialog_LOAD) {
-            result = ::GetOpenFileName(&ofn);
-        } else {
-            result = ::GetSaveFileName(&ofn);
+        if (useNewAPI) {
+            GUID fileDialogMode = mode == java_awt_FileDialog_LOAD ? CLSID_FileOpenDialog : CLSID_FileSaveDialog;
+            VERIFY(SUCCEEDED(::CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE)));
+            VERIFY(SUCCEEDED(::CoCreateInstance(fileDialogMode, NULL, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&pfd))));
+
+            data.fileDialog = pfd;
+            data.result = &pszFilePath;
+            data.peer = peer;
+            VERIFY(SUCCEEDED(CDialogEventHandler_CreateInstance(&data, IID_PPV_ARGS(&pfde))));
+            VERIFY(SUCCEEDED(pfd->Advise(pfde, &dwCookie)));
+
+            DWORD dwFlags;
+            VERIFY(SUCCEEDED(pfd->GetOptions(&dwFlags)));
+            dwFlags |= FOS_FORCEFILESYSTEM;
+            if (multipleMode == JNI_TRUE) {
+                dwFlags |= FOS_ALLOWMULTISELECT;
+            }
+            VERIFY(SUCCEEDED(pfd->SetOptions(dwFlags)));
+
+            VERIFY(SUCCEEDED(pfd->SetTitle(titleBuffer)));
+
+            UINT filterCount;
+            fileTypes = CreateFilterSpec(&filterCount);
+
+            VERIFY(SUCCEEDED(pfd->SetFileTypes(filterCount, fileTypes)));
+            VERIFY(SUCCEEDED(pfd->SetFileTypeIndex(1)));
+
+            IShellItem *directoryItem = CreateShellItem(directoryBuffer);
+            if (directoryItem != NULL) {
+                pfd->SetFolder(directoryItem);
+                directoryItem->Release();
+            }
+            LPTSTR shortName = GetShortName(fileBuffer);
+            if (shortName != NULL) {
+                VERIFY(SUCCEEDED(pfd->SetFileName(shortName)));
+                CoTaskMemFree(shortName);
+            }
         }
-        // Fix for 4181310: FileDialog does not show up.
-        // If the dialog is not shown because of invalid file name
-        // replace the file name by empty string.
-        if (!result) {
-            dlgerr = ::CommDlgExtendedError();
-            if (dlgerr == FNERR_INVALIDFILENAME) {
-                _tcscpy_s(fileBuffer, bufferLimit, TEXT(""));
-                if (mode == java_awt_FileDialog_LOAD) {
-                    result = ::GetOpenFileName(&ofn);
-                } else {
-                    result = ::GetSaveFileName(&ofn);
+
+        if (useNewAPI) {
+            if (mode == java_awt_FileDialog_LOAD) {
+                result = SUCCEEDED(pfd->Show(NULL));
+                if (result) {
+                    result = pszFilePath != NULL;
+                    if (!result) {
+                        result = SUCCEEDED(pfd->GetResult(&psiResult));
+                        if (result) {
+                            LPTSTR filePath;
+                            result = SUCCEEDED(psiResult->GetDisplayName(SIGDN_FILESYSPATH, &filePath));
+                            size_t filePathLength = _tcslen(filePath);
+                            pszFilePath = new TCHAR[filePathLength + 1];
+                            _tcscpy_s(pszFilePath, filePathLength + 1, filePath);
+                            ::CoTaskMemFree(filePath);
+                        }
+                    }
+                }
+            } else {
+                result = SUCCEEDED(pfd->Show(NULL));
+                if (result) {
+                    result = SUCCEEDED(pfd->GetResult(&psiResult));
+                    if (result) {
+                        LPTSTR filePath;
+                        result = SUCCEEDED(psiResult->GetDisplayName(SIGDN_FILESYSPATH, &filePath));
+                        size_t filePathLength = _tcslen(filePath);
+                        pszFilePath = new TCHAR[filePathLength + 1];
+                        _tcscpy_s(pszFilePath, filePathLength + 1, filePath);
+                        ::CoTaskMemFree(filePath);
+                    }
+                }
+            }
+        } else {
+            // show the Win32 file dialog
+            if (mode == java_awt_FileDialog_LOAD) {
+                result = ::GetOpenFileName(&ofn);
+            } else {
+                result = ::GetSaveFileName(&ofn);
+            }
+            // Fix for 4181310: FileDialog does not show up.
+            // If the dialog is not shown because of invalid file name
+            // replace the file name by empty string.
+            if (!result) {
+                dlgerr = ::CommDlgExtendedError();
+                if (dlgerr == FNERR_INVALIDFILENAME) {
+                    _tcscpy_s(fileBuffer, bufferLimit, TEXT(""));
+                    if (mode == java_awt_FileDialog_LOAD) {
+                        result = ::GetOpenFileName(&ofn);
+                    } else {
+                        result = ::GetSaveFileName(&ofn);
+                    }
                 }
             }
         }
@@ -376,19 +726,31 @@ AwtFileDialog::Show(void *p)
 
         AwtDialog::ModalActivateNextWindow(NULL, target, peer);
 
-        VERIFY(::SetCurrentDirectory(currentDirectory));
+        if (useNewAPI) {
+            VERIFY(::SetCurrentDirectory(currentDirectory));
+        }
 
         // Report result to peer.
         if (result) {
-            jint length = multipleMode
-                    ? (jint)GetBufferLength(ofn.lpstrFile, ofn.nMaxFile)
-                    : (jint)_tcslen(ofn.lpstrFile);
+            jint length;
+            if (useNewAPI) {
+                length = (jint) GetBufferLength(pszFilePath, data.resultSize);
+            } else {
+                length = multipleMode
+                         ? (jint) GetBufferLength(ofn.lpstrFile, ofn.nMaxFile)
+                         : (jint) _tcslen(ofn.lpstrFile);
+            }
+
             jcharArray jnames = env->NewCharArray(length);
             if (jnames == NULL) {
                 throw std::bad_alloc();
             }
-            env->SetCharArrayRegion(jnames, 0, length, (jchar*)ofn.lpstrFile);
 
+            if (useNewAPI) {
+                env->SetCharArrayRegion(jnames, 0, length, (jchar *) pszFilePath);
+            } else {
+                env->SetCharArrayRegion(jnames, 0, length, (jchar *) ofn.lpstrFile);
+            }
             env->CallVoidMethod(peer, AwtFileDialog::handleSelectedMID, jnames);
             env->DeleteLocalRef(jnames);
         } else {
@@ -396,6 +758,22 @@ AwtFileDialog::Show(void *p)
         }
         DASSERT(!safe_ExceptionOccurred(env));
     } catch (...) {
+
+        if (useNewAPI) {
+            if (psiResult)
+                psiResult->Release();
+            if (pfd) {
+                pfd->Unadvise(dwCookie);
+                pfd->Release();
+            }
+            if (pfde)
+                pfde->Release();
+            if (pszFilePath)
+                delete [] pszFilePath;
+            if (fileTypes)
+                delete [] fileTypes;
+            ::CoUninitialize();
+        }
 
         env->DeleteLocalRef(target);
         env->DeleteLocalRef(parent);
@@ -409,6 +787,22 @@ AwtFileDialog::Show(void *p)
         if (ofn.lpstrFile)
             delete[] ofn.lpstrFile;
         throw;
+    }
+
+    if (useNewAPI) {
+        if (psiResult)
+            psiResult->Release();
+        if (pfd) {
+            pfd->Unadvise(dwCookie);
+            pfd->Release();
+        }
+        if (pfde)
+            pfde->Release();
+        if (pszFilePath)
+            delete[] pszFilePath;
+        if (fileTypes)
+            delete[] fileTypes;
+        CoUninitialize();
     }
 
     env->DeleteLocalRef(target);

@@ -507,7 +507,6 @@ AwtFileDialog::Show(void *p)
 {
     JNIEnv *env = (JNIEnv *)JNU_GetEnv(jvm, JNI_VERSION_1_2);
     jobject peer;
-    LPTSTR fileBuffer = NULL;
     LPTSTR currentDirectory = NULL;
     jint mode = 0;
     BOOL result = FALSE;
@@ -534,12 +533,10 @@ AwtFileDialog::Show(void *p)
 
     peer = (jobject)p;
 
-    BOOL useNewAPI = FALSE;
+    static BOOL useNewAPI = JNU_CallStaticMethodByName(env, NULL,
+            "sun/awt/windows/WFileDialogPeer", "isUseNewAPI", "()Z").z == JNI_TRUE;
     try {
         DASSERT(peer);
-
-        useNewAPI = JNU_CallStaticMethodByName(env, NULL,
-                "sun/awt/windows/WFileDialogPeer", "isUseNewAPI", "()Z").z == JNI_TRUE;
 
         target = env->GetObjectField(peer, AwtObject::targetID);
         parent = env->GetObjectField(peer, AwtFileDialog::parentID);

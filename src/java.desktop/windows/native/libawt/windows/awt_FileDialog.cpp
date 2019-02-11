@@ -27,6 +27,7 @@
 #include "awt_FileDialog.h"
 #include "awt_Dialog.h"
 #include "awt_Toolkit.h"
+#include "awt_ole.h"
 #include "ComCtl32Util.h"
 #include <commdlg.h>
 #include <cderr.h>
@@ -65,6 +66,13 @@ static const TCHAR s_additionalString[] = TEXT(" (*.*)\0*.*\0");
 
 // The name of the property holding the pointer to the OPENFILENAME structure.
 static LPCTSTR OpenFileNameProp = TEXT("AWT_OFN");
+
+_COM_SMARTPTR_TYPEDEF(IFileDialog, __uuidof(IFileDialog));
+_COM_SMARTPTR_TYPEDEF(IFileDialogEvents, __uuidof(IFileDialogEvents));
+_COM_SMARTPTR_TYPEDEF(IShellItem, __uuidof(IShellItem));
+_COM_SMARTPTR_TYPEDEF(IFileOpenDialog, __uuidof(IFileOpenDialog));
+_COM_SMARTPTR_TYPEDEF(IShellItemArray, __uuidof(IShellItemArray));
+_COM_SMARTPTR_TYPEDEF(IOleWindowPtr, __uuidof(IOleWindowPtr));
 
 /***********************************************************************/
 
@@ -245,58 +253,53 @@ struct FileDialogData {
     jobject peer;
 };
 
-void GetSelectedResults(FileDialogData *data) {
-    IFileOpenDialog *fileOpenDialog = NULL;
-    if (!SUCCEEDED(data->fileDialog->QueryInterface(IID_PPV_ARGS(&fileOpenDialog))))
-        return;
+HRESULT GetSelectedResults(FileDialogData *data) {
+    OLE_TRY
 
+    IFileOpenDialogPtr fileOpenDialog;
     LPTSTR resultBuffer = NULL;
     UINT currentOffset = 0;
-    IShellItemArray *psia;
-    if (SUCCEEDED(fileOpenDialog->GetSelectedItems(&psia))) {
-        DWORD itemsCount;
-        if (SUCCEEDED(psia->GetCount(&itemsCount))) {
-            UINT maxBufferSize = (MAX_PATH + 1) * itemsCount + 1;
-            resultBuffer = new TCHAR[maxBufferSize];
-            data->resultSize = maxBufferSize;
-            for (DWORD i = 0; i < itemsCount; i++) {
-                IShellItem *psi;
-                if (SUCCEEDED(psia->GetItemAt(i, &psi))) {
-                    if (i == 0 && itemsCount > 1) {
-                        IShellItem *psiParent;
-                        VERIFY(SUCCEEDED(psi->GetParent(&psiParent)));
+    IShellItemArrayPtr psia;
+    DWORD itemsCount;
 
-                        LPTSTR filePath;
-                        if (SUCCEEDED(psiParent->GetDisplayName(SIGDN_FILESYSPATH, &filePath))) {
-                            size_t filePathLength = _tcslen(filePath);
-                            _tcsncpy(resultBuffer + currentOffset, filePath, filePathLength);
-                            resultBuffer[currentOffset + filePathLength] = _T('\0');
-                            currentOffset += filePathLength + 1;
-                            CoTaskMemFree(filePath);
-                        }
-                        psiParent->Release();
-                    }
+    OLE_HRT(data->fileDialog->QueryInterface(IID_PPV_ARGS(&fileOpenDialog)))
+    OLE_HRT(fileOpenDialog->GetSelectedItems(&psia));
+    OLE_HRT(psia->GetCount(&itemsCount));
 
-                    LPTSTR filePath;
-                    SIGDN displayForm = itemsCount > 1 ? SIGDN_PARENTRELATIVE : SIGDN_FILESYSPATH;
-                    if (SUCCEEDED(psi->GetDisplayName(displayForm, &filePath))) {
-                        size_t filePathLength = _tcslen(filePath);
-                        _tcsncpy(resultBuffer + currentOffset, filePath, filePathLength);
-                        resultBuffer[currentOffset + filePathLength] = _T('\0');
-                        currentOffset += filePathLength + 1;
-                        CoTaskMemFree(filePath);
-                    }
-                    psi->Release();
-                }
-            }
-            resultBuffer[currentOffset] = _T('\0');
-            resultBuffer[currentOffset + 1] = _T('\0');
-            *(data->result) = resultBuffer;
+    UINT maxBufferSize = (MAX_PATH + 1) * itemsCount + 1;
+    resultBuffer = new TCHAR[maxBufferSize];
+    data->resultSize = maxBufferSize;
+    for (DWORD i = 0; i < itemsCount; i++) {
+        IShellItemPtr psi;
+        OLE_HRT(psia->GetItemAt(i, &psi));
+        if (i == 0 && itemsCount > 1) {
+            IShellItemPtr psiParent;
+            LPTSTR filePath;
+            OLE_HRT(psi->GetParent(&psiParent));
+            OLE_HRT(psiParent->GetDisplayName(SIGDN_FILESYSPATH, &filePath));
+            size_t filePathLength = _tcslen(filePath);
+            _tcsncpy(resultBuffer + currentOffset, filePath, filePathLength);
+            resultBuffer[currentOffset + filePathLength] = _T('\0');
+            currentOffset += filePathLength + 1;
+            CoTaskMemFree(filePath);
         }
-        psia->Release();
-        data->fileDialog->Close(S_OK);
+
+        LPTSTR filePath;
+        SIGDN displayForm = itemsCount > 1 ? SIGDN_PARENTRELATIVE : SIGDN_FILESYSPATH;
+        OLE_HRT(psi->GetDisplayName(displayForm, &filePath));
+        size_t filePathLength = _tcslen(filePath);
+        _tcsncpy(resultBuffer + currentOffset, filePath, filePathLength);
+        resultBuffer[currentOffset + filePathLength] = _T('\0');
+        currentOffset += filePathLength + 1;
+        CoTaskMemFree(filePath);
     }
-    fileOpenDialog->Release();
+    resultBuffer[currentOffset] = _T('\0');
+    resultBuffer[currentOffset + 1] = _T('\0');
+    *(data->result) = resultBuffer;
+    data->fileDialog->Close(S_OK);
+
+    OLE_CATCH
+    OLE_RETURN_HR
 }
 
 LRESULT CALLBACK
@@ -397,17 +400,17 @@ private:
     void InitDialog(IFileDialog *fileDialog) {
         JNIEnv *env = (JNIEnv *)JNU_GetEnv(jvm, JNI_VERSION_1_2);
 
-        IOleWindow *pWindow = NULL;
+        IOleWindowPtr pWindow;
         HRESULT hr = fileDialog->QueryInterface(IID_PPV_ARGS(&pWindow));
 
         if (!SUCCEEDED(hr))
             return;
 
         TRY;
+        OLE_TRY
 
         HWND hdlg;
-        VERIFY(SUCCEEDED(pWindow->GetWindow(&hdlg)));
-        pWindow->Release();
+        OLE_HRT(pWindow->GetWindow(&hdlg));
 
         HWND parent = ::GetParent(hdlg);
         jobject peer = data->peer;
@@ -434,6 +437,7 @@ private:
 
         SetWindowSubclass(hdlg, &FileDialogSubclassProc, 0, (DWORD_PTR) data);
 
+        OLE_CATCH
         CATCH_BAD_ALLOC;
     }
 };
@@ -477,28 +481,23 @@ COMDLG_FILTERSPEC *CreateFilterSpec(UINT *count) {
     return filterSpec;
 }
 
-IShellItem *CreateShellItem(LPTSTR path) {
+HRESULT CreateShellItem(LPTSTR path, IShellItem *shellItem) {
     size_t pathLength = _tcslen(path);
     for (size_t index = 0; index < pathLength; index++) {
         if (path[index] == _T('/'))
             path[index] = _T('\\');
     }
 
-    IShellItem *shellItem;
-    HRESULT hr = ::SHCreateItemInKnownFolder(FOLDERID_ComputerFolder, 0, path, IID_PPV_ARGS(&shellItem));
-    if (SUCCEEDED(hr) && shellItem != NULL)
-        return shellItem;
-    return NULL;
+    return ::SHCreateItemInKnownFolder(FOLDERID_ComputerFolder, 0, path, IID_PPV_ARGS(&shellItem));
 }
 
 LPTSTR GetShortName(LPTSTR path) {
-    IShellItem *shellItem = CreateShellItem(path);
-    if (shellItem == NULL)
+    IShellItemPtr shellItem;
+    if (FAILED(CreateShellItem(path, shellItem)))
         return NULL;
 
     LPTSTR shortName = NULL;
     shellItem->GetDisplayName(SIGDN_PARENTRELATIVE, &shortName);
-    shellItem->Release();
     return shortName;
 }
 
@@ -520,10 +519,10 @@ AwtFileDialog::Show(void *p)
     AwtComponent* awtParent = NULL;
     jboolean multipleMode = JNI_FALSE;
 
-    IFileDialog *pfd = NULL;
-    IFileDialogEvents *pfde = NULL;
+    IFileDialogPtr pfd;
+    IFileDialogEventsPtr pfde;
     DWORD dwCookie;
-    IShellItem *psiResult = NULL;
+    IShellItemPtr psiResult;
     LPTSTR pszFilePath = NULL;
     COMDLG_FILTERSPEC *fileTypes = NULL;
     FileDialogData data;
@@ -624,74 +623,75 @@ AwtFileDialog::Show(void *p)
 
         AwtDialog::CheckInstallModalHook();
 
+        OLE_DECL
         if (useNewAPI) {
+            OLE_NEXT_TRY
             GUID fileDialogMode = mode == java_awt_FileDialog_LOAD ? CLSID_FileOpenDialog : CLSID_FileSaveDialog;
-            VERIFY(SUCCEEDED(::CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE)));
-            VERIFY(SUCCEEDED(::CoCreateInstance(fileDialogMode, NULL, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&pfd))));
+            OLE_HRT(::CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE));
+            OLE_HRT(::CoCreateInstance(fileDialogMode, NULL, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&pfd)));
 
             data.fileDialog = pfd;
             data.result = &pszFilePath;
             data.peer = peer;
-            VERIFY(SUCCEEDED(CDialogEventHandler_CreateInstance(&data, IID_PPV_ARGS(&pfde))));
-            VERIFY(SUCCEEDED(pfd->Advise(pfde, &dwCookie)));
+            OLE_HRT(CDialogEventHandler_CreateInstance(&data, IID_PPV_ARGS(&pfde)));
+            OLE_HRT(pfd->Advise(pfde, &dwCookie));
 
             DWORD dwFlags;
-            VERIFY(SUCCEEDED(pfd->GetOptions(&dwFlags)));
+            OLE_HRT(pfd->GetOptions(&dwFlags));
             dwFlags |= FOS_FORCEFILESYSTEM;
             if (multipleMode == JNI_TRUE) {
                 dwFlags |= FOS_ALLOWMULTISELECT;
             }
-            VERIFY(SUCCEEDED(pfd->SetOptions(dwFlags)));
+            OLE_HRT(pfd->SetOptions(dwFlags));
 
-            VERIFY(SUCCEEDED(pfd->SetTitle(titleBuffer)));
+            OLE_HRT(pfd->SetTitle(titleBuffer));
 
             UINT filterCount;
             fileTypes = CreateFilterSpec(&filterCount);
 
-            VERIFY(SUCCEEDED(pfd->SetFileTypes(filterCount, fileTypes)));
-            VERIFY(SUCCEEDED(pfd->SetFileTypeIndex(1)));
+            OLE_HRT(pfd->SetFileTypes(filterCount, fileTypes));
+            OLE_HRT(pfd->SetFileTypeIndex(1));
 
-            IShellItem *directoryItem = CreateShellItem(directoryBuffer);
-            if (directoryItem != NULL) {
+            IShellItemPtr directoryItem;
+            if (SUCCEEDED(CreateShellItem(directoryBuffer, directoryItem))) {
                 pfd->SetFolder(directoryItem);
-                directoryItem->Release();
             }
             LPTSTR shortName = GetShortName(fileBuffer);
             if (shortName != NULL) {
-                VERIFY(SUCCEEDED(pfd->SetFileName(shortName)));
+                OLE_HRT(pfd->SetFileName(shortName));
                 CoTaskMemFree(shortName);
             }
+            OLE_CATCH
         }
 
-        if (useNewAPI) {
+        if (useNewAPI && SUCCEEDED(OLE_HR)) {
             if (mode == java_awt_FileDialog_LOAD) {
-                result = SUCCEEDED(pfd->Show(NULL));
-                if (result) {
-                    result = pszFilePath != NULL;
-                    if (!result) {
-                        result = SUCCEEDED(pfd->GetResult(&psiResult));
-                        if (result) {
-                            LPTSTR filePath;
-                            result = SUCCEEDED(psiResult->GetDisplayName(SIGDN_FILESYSPATH, &filePath));
-                            size_t filePathLength = _tcslen(filePath);
-                            pszFilePath = new TCHAR[filePathLength + 1];
-                            _tcscpy_s(pszFilePath, filePathLength + 1, filePath);
-                            ::CoTaskMemFree(filePath);
-                        }
-                    }
+                result = SUCCEEDED(pfd->Show(NULL)) && pszFilePath != NULL;
+                if (!result) {
+                    OLE_NEXT_TRY
+                    OLE_HRT(pfd->GetResult(&psiResult));
+                    LPTSTR filePath;
+                    OLE_HRT(psiResult->GetDisplayName(SIGDN_FILESYSPATH, &filePath));
+                    size_t filePathLength = _tcslen(filePath);
+                    pszFilePath = new TCHAR[filePathLength + 1];
+                    _tcscpy_s(pszFilePath, filePathLength + 1, filePath);
+                    ::CoTaskMemFree(filePath);
+                    OLE_CATCH
+                    result = SUCCEEDED(OLE_HR);
                 }
             } else {
                 result = SUCCEEDED(pfd->Show(NULL));
                 if (result) {
-                    result = SUCCEEDED(pfd->GetResult(&psiResult));
-                    if (result) {
-                        LPTSTR filePath;
-                        result = SUCCEEDED(psiResult->GetDisplayName(SIGDN_FILESYSPATH, &filePath));
-                        size_t filePathLength = _tcslen(filePath);
-                        pszFilePath = new TCHAR[filePathLength + 1];
-                        _tcscpy_s(pszFilePath, filePathLength + 1, filePath);
-                        ::CoTaskMemFree(filePath);
-                    }
+                    OLE_NEXT_TRY
+                    OLE_HRT(pfd->GetResult(&psiResult));
+                    LPTSTR filePath;
+                    OLE_HRT(psiResult->GetDisplayName(SIGDN_FILESYSPATH, &filePath));
+                    size_t filePathLength = _tcslen(filePath);
+                    pszFilePath = new TCHAR[filePathLength + 1];
+                    _tcscpy_s(pszFilePath, filePathLength + 1, filePath);
+                    ::CoTaskMemFree(filePath);
+                    OLE_CATCH
+                    result = SUCCEEDED(OLE_HR);
                 }
             }
         } else {
@@ -757,14 +757,9 @@ AwtFileDialog::Show(void *p)
     } catch (...) {
 
         if (useNewAPI) {
-            if (psiResult)
-                psiResult->Release();
             if (pfd) {
                 pfd->Unadvise(dwCookie);
-                pfd->Release();
             }
-            if (pfde)
-                pfde->Release();
             if (pszFilePath)
                 delete [] pszFilePath;
             if (fileTypes)
@@ -787,14 +782,9 @@ AwtFileDialog::Show(void *p)
     }
 
     if (useNewAPI) {
-        if (psiResult)
-            psiResult->Release();
         if (pfd) {
             pfd->Unadvise(dwCookie);
-            pfd->Release();
         }
-        if (pfde)
-            pfde->Release();
         if (pszFilePath)
             delete[] pszFilePath;
         if (fileTypes)

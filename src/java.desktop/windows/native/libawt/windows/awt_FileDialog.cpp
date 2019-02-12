@@ -551,8 +551,8 @@ AwtFileDialog::Show(void *p)
 
     peer = (jobject)p;
 
-    static BOOL useNewAPI = JNU_CallStaticMethodByName(env, NULL,
-            "sun/awt/windows/WFileDialogPeer", "isUseNewAPI", "()Z").z == JNI_TRUE;
+    static BOOL useCommonItemDialog = JNU_CallStaticMethodByName(env, NULL,
+            "sun/awt/windows/WFileDialogPeer", "useCommonItemDialog", "()Z").z == JNI_TRUE;
     try {
         DASSERT(peer);
 
@@ -599,7 +599,7 @@ AwtFileDialog::Show(void *p)
 
         fileFilter = env->GetObjectField(peer, AwtFileDialog::fileFilterID);
 
-        if (!useNewAPI) {
+        if (!useCommonItemDialog) {
             ofn.lStructSize = sizeof(ofn);
             ofn.lpstrFilter = s_fileFilterString;
             ofn.nFilterIndex = 1;
@@ -644,7 +644,7 @@ AwtFileDialog::Show(void *p)
 
         OLE_DECL
         OLEHolder _ole_;
-        if (useNewAPI) {
+        if (useCommonItemDialog) {
             OLE_NEXT_TRY
             GUID fileDialogMode = mode == java_awt_FileDialog_LOAD ? CLSID_FileOpenDialog : CLSID_FileSaveDialog;
             OLE_HRT(::CoCreateInstance(fileDialogMode, NULL, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&pfd)));
@@ -682,7 +682,7 @@ AwtFileDialog::Show(void *p)
             OLE_CATCH
         }
 
-        if (useNewAPI && SUCCEEDED(OLE_HR)) {
+        if (useCommonItemDialog && SUCCEEDED(OLE_HR)) {
             if (mode == java_awt_FileDialog_LOAD) {
                 result = SUCCEEDED(pfd->Show(NULL)) && pszFilePath != NULL;
                 if (!result) {
@@ -739,14 +739,14 @@ AwtFileDialog::Show(void *p)
 
         AwtDialog::ModalActivateNextWindow(NULL, target, peer);
 
-        if (useNewAPI) {
+        if (useCommonItemDialog) {
             VERIFY(::SetCurrentDirectory(currentDirectory));
         }
 
         // Report result to peer.
         if (result) {
             jint length;
-            if (useNewAPI) {
+            if (useCommonItemDialog) {
                 length = (jint) GetBufferLength(pszFilePath, data.resultSize);
             } else {
                 length = multipleMode
@@ -759,7 +759,7 @@ AwtFileDialog::Show(void *p)
                 throw std::bad_alloc();
             }
 
-            if (useNewAPI) {
+            if (useCommonItemDialog) {
                 env->SetCharArrayRegion(jnames, 0, length, (jchar *) pszFilePath);
             } else {
                 env->SetCharArrayRegion(jnames, 0, length, (jchar *) ofn.lpstrFile);
@@ -772,7 +772,7 @@ AwtFileDialog::Show(void *p)
         DASSERT(!safe_ExceptionOccurred(env));
     } catch (...) {
 
-        if (useNewAPI) {
+        if (useCommonItemDialog) {
             if (pfd) {
                 pfd->Unadvise(dwCookie);
             }
@@ -796,7 +796,7 @@ AwtFileDialog::Show(void *p)
         throw;
     }
 
-    if (useNewAPI) {
+    if (useCommonItemDialog) {
         if (pfd) {
             pfd->Unadvise(dwCookie);
         }
